@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Python device log agent
-- Sources: journald (-o json -f) or tail -F file(s)
+- Sources: journald (-o json -f) or tail -f file(s) or demo generator
 - Transport: WebSocket (ws:// or wss://), 1 JSON record per message
 - Offline-friendly: spools to disk and drains on reconnect
-- Config: env vars or CLI flags (see bottom)
+- Snapshots: periodic "type: snapshot" frames with OS/IP/containers for UI Summary
+- Config: env vars or CLI flags (see constants below)
 
-Test mode: --demo (generates synthetic logs)
+Requires: pip3 install websockets
 """
 
 import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess, shlex
@@ -16,12 +17,17 @@ from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 # ---------- Config helpers ----------
 def env(key, default=None, cast=str):
     v = os.environ.get(key, None)
-    if v is None: return default
-    try: return cast(v)
-    except: return v
+    if v is None:
+        return default
+    try:
+        return cast(v)
+    except:
+        return v
 
 SERVER     = env("SERVER_URL", "ws://127.0.0.1:4000/ingest")
-DEVICE_ID  = env("DEVICE_ID", (pathlib.Path("/etc/machine-id").read_text().strip() if pathlib.Path("/etc/machine-id").exists() else os.uname().nodename))
+DEVICE_ID  = env("DEVICE_ID", (pathlib.Path("/etc/machine-id").read_text().strip()
+                               if pathlib.Path("/etc/machine-id").exists()
+                               else os.uname().nodename))
 INPUT      = env("INPUT", "journal")               # 'journal' | 'files' | 'demo'
 FILES      = env("FILES", "")                      # comma-separated, glob patterns allowed
 SPOOL_DIR  = pathlib.Path(env("SPOOL_DIR", "/var/lib/device-agent/spool"))
@@ -30,6 +36,10 @@ PING_SEC   = int(env("PING_SEC", 30))
 RECONNECT_MIN = float(env("RECONNECT_MIN", 1.5))
 RECONNECT_MAX = float(env("RECONNECT_MAX", 20.0))
 VERBOSE    = env("VERBOSE", "0") == "1"
+
+# Snapshot heartbeat for Summary panel
+SNAPSHOT_SEC = int(env("SNAPSHOT_SEC", 10))  # <=0 disables snapshots
+RUNTIME_OVERRIDE = env("CONTAINER_RUNTIME", "")  # 'docker' | 'podman' (optional)
 
 # WebSocket library
 try:
@@ -122,7 +132,6 @@ async def read_journal(queue: asyncio.Queue):
         *full_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        # NOTE: leave text=False; we decode manually to control errors/newlines
     )
 
     async def _stderr():
@@ -138,7 +147,6 @@ async def read_journal(queue: asyncio.Queue):
     while True:
         bline = await proc.stdout.readline()
         if not bline:
-            # process ended or temporary hiccup; brief nap to avoid spin
             await asyncio.sleep(0.05)
             if proc.returncode is not None:
                 if VERBOSE:
@@ -158,7 +166,6 @@ async def read_journal(queue: asyncio.Queue):
         obj.setdefault("TS", datetime.now(timezone.utc).isoformat())
 
         if VERBOSE:
-            # keep it short in logs
             preview = obj.get("MESSAGE") if isinstance(obj, dict) else str(obj)
             if preview is not None:
                 preview = str(preview)
@@ -176,7 +183,7 @@ async def read_files(queue: asyncio.Queue, files_csv: str):
         print("[src] FILES is empty for INPUT=files", file=sys.stderr)
         return
 
-    # Use /bin/sh so globs expand; fall back to -f (BusyBox often lacks -F)
+    # Use /bin/sh so globs expand; -f for BusyBox (often lacks -F)
     cmd = f"exec tail -n0 -f {files_csv}"
     if VERBOSE:
         print("[src] exec:", cmd)
@@ -227,13 +234,202 @@ async def read_demo(queue: asyncio.Queue):
         await queue.put(json.dumps(obj, separators=(",", ":")))
         await asyncio.sleep(0.2)  # 5 msgs/sec
 
+# ---------- Snapshot helpers (for Summary left panel) ----------
+def _sh(cmd: str):
+    try:
+        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
+        return 0, out.decode("utf-8", "replace").strip()
+    except subprocess.CalledProcessError as e:
+        return e.returncode, (e.output.decode("utf-8", "replace") if e.output else "").strip()
+
+def detect_runtime():
+    """
+    Prefer podman when available (common on embedded distros where a docker shim exists).
+    Allow RUNTIME_OVERRIDE to force one.
+    """
+    if RUNTIME_OVERRIDE:
+        return RUNTIME_OVERRIDE
+    try:
+        import shutil
+        # prefer podman first; then docker
+        if shutil.which("podman"):
+            return "podman"
+        if shutil.which("docker"):
+            return "docker"
+    except Exception:
+        pass
+    return None
+
+
+def _parse_ps_pipe_lines(out):
+    """
+    Parse pipe-delimited fallback: ID|Names|Image|Status|Ports (may vary slightly per runtime)
+    """
+    items = []
+    for ln in out.splitlines():
+        parts = ln.split("|")
+        if len(parts) >= 4:
+            cid, names, image, status = parts[:4]
+            ports = parts[4] if len(parts) > 4 else ""
+            items.append({
+                "id": cid.strip(),
+                "name": (names or "").strip(),
+                "image": (image or "").strip(),
+                "status": (status or "").strip(),
+                "state": "",  # unknown in this fallback
+                "ports": (ports or "").strip(),
+            })
+    return items
+
+
+def list_containers():
+    r = detect_runtime()
+    if not r:
+        if VERBOSE: print("[snap] no container runtime found")
+        return []
+
+    # --- PODMAN path ---
+    if r == "podman":
+        # 1) Native array JSON (best)
+        rc, out = _sh("podman ps --all --format json")
+        if rc == 0 and out:
+            try:
+                arr = json.loads(out)
+                items = []
+                for row in arr:
+                    items.append({
+                        "id": row.get("Id") or row.get("ID"),
+                        "name": (row.get("Names") or row.get("Name") or [""])[0] if isinstance(row.get("Names"), list) else (row.get("Names") or row.get("Name")),
+                        "image": row.get("Image") or row.get("ImageName"),
+                        "status": row.get("Status") or row.get("State"),
+                        "state": row.get("State") or "",
+                        "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
+                    })
+                if items:
+                    return items
+            except Exception as e:
+                if VERBOSE: print("[snap] podman json array parse failed:", e)
+
+        # 2) Line-per-row JSON
+        rc, out = _sh("podman ps -a --format '{{json .}}'")
+        if rc == 0 and out:
+            items = []
+            for line in out.splitlines():
+                line = line.strip()
+                if not line: continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                items.append({
+                    "id": row.get("ID") or row.get("Id"),
+                    "name": row.get("Names") or row.get("Name"),
+                    "image": row.get("Image") or row.get("ImageName"),
+                    "status": row.get("Status") or row.get("State"),
+                    "state": row.get("State") or "",
+                    "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
+                })
+            if items:
+                return items
+
+        # 3) Pipe-delimited fallback
+        rc, out = _sh("podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
+        if rc == 0 and out:
+            return _parse_ps_pipe_lines(out)
+
+        if VERBOSE: print("[snap] podman ps produced no containers")
+        return []
+
+    # --- DOCKER path ---
+    # 1) Line-per-row JSON (common)
+    rc, out = _sh("docker ps -a --format '{{json .}}'")
+    if rc == 0 and out:
+        items = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line: continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            items.append({
+                "id": row.get("ID") or row.get("Id"),
+                "name": row.get("Names") or row.get("Name"),
+                "image": row.get("Image"),
+                "status": row.get("Status"),
+                "state": row.get("State") or "",
+                "ports": row.get("Ports"),
+            })
+        if items:
+            return items
+
+    # 2) Pipe-delimited fallback
+    rc, out = _sh("docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
+    if rc == 0 and out:
+        return _parse_ps_pipe_lines(out)
+
+    if VERBOSE: print("[snap] docker ps produced no containers")
+    return []
+
+def get_os_info():
+    name = version = build = ""
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as f:
+            data = {}
+            for ln in f:
+                if "=" in ln:
+                    k, v = ln.split("=", 1)
+                    data[k.strip()] = v.strip().strip('"')
+            name = data.get("NAME", "")
+            version = data.get("VERSION", "") or data.get("VERSION_ID", "")
+            build = data.get("BUILD_ID", "") or data.get("IMAGE_ID", "") or data.get("PRETTY_NAME", "")
+    except Exception:
+        pass
+    rc, kernel = _sh("uname -r")
+    return {"name": name, "version": version, "kernel": kernel, "build": build}
+
+def get_ips():
+    rc, out = _sh("ip -4 -o addr show scope global | awk '{print $2\"|\"$4}'")
+    ips = []
+    if rc == 0 and out:
+        for ln in out.splitlines():
+            try:
+                iface, cidr = ln.split("|", 1)
+                ips.append({"if": iface, "cidr": cidr})
+            except Exception:
+                pass
+    return ips
+
+async def collect_snapshot():
+    return {
+        "type": "snapshot",
+        "device_id": DEVICE_ID,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "os": get_os_info(),
+        "ips": get_ips(),
+        "runtime": detect_runtime(),
+        "containers": list_containers(),
+    }
+
+async def snapshot_loop(queue: asyncio.Queue, interval_sec: int):
+    if interval_sec <= 0:
+        if VERBOSE:
+            print("[snap] disabled (SNAPSHOT_SEC<=0)")
+        return
+    while True:
+        snap = await collect_snapshot()
+        if VERBOSE:
+            cnt = len(snap.get("containers", []))
+            print(f"[snap] send: {snap['os'].get('name','')} {snap['os'].get('version','')} | {len(snap.get('ips',[]))} ip(s) | {cnt} container(s)")
+        await queue.put(json.dumps(snap, separators=(",", ":")))
+        await asyncio.sleep(interval_sec)
+
 # ---------- Sender ----------
 async def send_loop(queue: asyncio.Queue):
     """
     Maintain a WS connection; drain spool first, then send live queue.
     On failure: append to spool, backoff, and reconnect.
     """
-    import websockets
     backoff = RECONNECT_MIN
 
     while True:
@@ -261,10 +457,8 @@ async def send_loop(queue: asyncio.Queue):
                         if VERBOSE: print(f"[ws] drain failed ({e}); keeping {f.name}")
                         # stop draining; keep file for later
                         raise
-                # If we fully drained older files, we can safely remove them now
-                # (We remove after each full drain to keep it simple.)
+                # remove old spool files (not 'current')
                 for f in list(spool.files()):
-                    # remove files that are not 'current'
                     if f.name != "current.jsonl":
                         try: f.unlink()
                         except: pass
@@ -304,6 +498,9 @@ async def main():
         print(f"[agent] unknown INPUT={INPUT}", file=sys.stderr)
         return 2
 
+    # Start snapshot loop (for Summary left panel)
+    snap_task = asyncio.create_task(snapshot_loop(q, SNAPSHOT_SEC))
+
     # Sender
     sender = asyncio.create_task(send_loop(q))
 
@@ -314,17 +511,25 @@ async def main():
             print("[agent] stopping… flushing queue to spool")
             stopping.set()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, _stop)
+        try:
+            signal.signal(sig, _stop)
+        except Exception:
+            pass
 
     await stopping.wait()
     try:
-        src.cancel(); sender.cancel()
-    except: pass
+        src.cancel()
+        sender.cancel()
+        snap_task.cancel()
+    except:
+        pass
 
     # Drain queue to spool
     while not q.empty():
-        try: spool.put(q.get_nowait())
-        except: break
+        try:
+            spool.put(q.get_nowait())
+        except:
+            break
     print("[agent] bye")
 
 if __name__ == "__main__":
