@@ -5,12 +5,11 @@ Python device log agent
 - Transport: WebSocket (ws:// or wss://), 1 JSON record per message
 - Offline-friendly: spools to disk and drains on reconnect
 - Snapshots: periodic "type: snapshot" frames with OS/IP/containers for UI Summary
-- Config: env vars or CLI flags (see constants below)
-
+- Optional control: receive {type:'control',action:'reboot'} from server when AGENT_ALLOW_CONTROL=1
 Requires: pip3 install websockets
 """
 
-import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess, shlex
+import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 
@@ -37,6 +36,9 @@ RECONNECT_MIN = float(env("RECONNECT_MIN", 1.5))
 RECONNECT_MAX = float(env("RECONNECT_MAX", 20.0))
 VERBOSE    = env("VERBOSE", "0") == "1"
 
+# Control channel
+ALLOW_CONTROL = (env("AGENT_ALLOW_CONTROL", "0") == "1")
+
 # Snapshot heartbeat for Summary panel
 SNAPSHOT_SEC = int(env("SNAPSHOT_SEC", 10))  # <=0 disables snapshots
 RUNTIME_OVERRIDE = env("CONTAINER_RUNTIME", "")  # 'docker' | 'podman' (optional)
@@ -44,9 +46,8 @@ RUNTIME_OVERRIDE = env("CONTAINER_RUNTIME", "")  # 'docker' | 'podman' (optional
 # WebSocket library
 try:
     import websockets
-except Exception as e:
-    print("ERROR: This agent needs the 'websockets' package.\n"
-          "Install with: pip3 install websockets", file=sys.stderr)
+except Exception:
+    print("ERROR: This agent needs the 'websockets' package.\nInstall with: pip3 install websockets", file=sys.stderr)
     sys.exit(2)
 
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
@@ -100,22 +101,12 @@ spool = Spool(SPOOL_DIR, SPOOL_MAX_FILE)
 
 # ---------- Log sources ----------
 async def read_journal(queue: asyncio.Queue):
-    """
-    Follow journald as JSON lines (robust for BusyBox/Yocto):
-    - use stdbuf if available to force line-buffered stdout
-    - read with readline() to avoid iterator buffering edge cases
-    Env overrides:
-      JOURNAL_N: initial backfill count (default 0)
-      JOURNAL_UNIT: optional systemd unit filter (e.g. "sshd.service")
-      JOURNAL_SINCE: optional since string (e.g. "5 minutes ago")
-    """
     import shutil
     n = os.environ.get("JOURNAL_N", "0")
     unit = os.environ.get("JOURNAL_UNIT")
     since = os.environ.get("JOURNAL_SINCE")
 
     base = ["journalctl", "-o", "json", "--no-pager"]
-    # single process that both backfills and follows
     cmd = base + ["-f", "-n", str(n)]
     if unit:
         cmd += ["-u", unit]
@@ -143,7 +134,6 @@ async def read_journal(queue: asyncio.Queue):
                     pass
     asyncio.create_task(_stderr())
 
-    # Read line-by-line (robust on non-tty pipes)
     while True:
         bline = await proc.stdout.readline()
         if not bline:
@@ -167,23 +157,17 @@ async def read_journal(queue: asyncio.Queue):
 
         if VERBOSE:
             preview = obj.get("MESSAGE") if isinstance(obj, dict) else str(obj)
-            if preview is not None:
-                preview = str(preview)
+            preview = str(preview) if preview is not None else ""
             print("[src] journal -> queue:", (preview[:120] + "…") if preview and len(preview) > 120 else preview)
 
         await queue.put(json.dumps(obj, separators=(",", ":")))
 
 async def read_files(queue: asyncio.Queue, files_csv: str):
-    """
-    Tail plain files via 'tail -n0 -f' (use -f for BusyBox compatibility).
-    Globs are expanded by the shell.
-    """
     files_csv = (files_csv or "").strip()
     if not files_csv:
         print("[src] FILES is empty for INPUT=files", file=sys.stderr)
         return
 
-    # Use /bin/sh so globs expand; -f for BusyBox (often lacks -F)
     cmd = f"exec tail -n0 -f {files_csv}"
     if VERBOSE:
         print("[src] exec:", cmd)
@@ -234,7 +218,7 @@ async def read_demo(queue: asyncio.Queue):
         await queue.put(json.dumps(obj, separators=(",", ":")))
         await asyncio.sleep(0.2)  # 5 msgs/sec
 
-# ---------- Snapshot helpers (for Summary left panel) ----------
+# ---------- Snapshot & system info ----------
 def _sh(cmd: str):
     try:
         out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
@@ -243,15 +227,10 @@ def _sh(cmd: str):
         return e.returncode, (e.output.decode("utf-8", "replace") if e.output else "").strip()
 
 def detect_runtime():
-    """
-    Prefer podman when available (common on embedded distros where a docker shim exists).
-    Allow RUNTIME_OVERRIDE to force one.
-    """
     if RUNTIME_OVERRIDE:
         return RUNTIME_OVERRIDE
     try:
         import shutil
-        # prefer podman first; then docker
         if shutil.which("podman"):
             return "podman"
         if shutil.which("docker"):
@@ -260,11 +239,7 @@ def detect_runtime():
         pass
     return None
 
-
 def _parse_ps_pipe_lines(out):
-    """
-    Parse pipe-delimited fallback: ID|Names|Image|Status|Ports (may vary slightly per runtime)
-    """
     items = []
     for ln in out.splitlines():
         parts = ln.split("|")
@@ -276,11 +251,10 @@ def _parse_ps_pipe_lines(out):
                 "name": (names or "").strip(),
                 "image": (image or "").strip(),
                 "status": (status or "").strip(),
-                "state": "",  # unknown in this fallback
+                "state": "",
                 "ports": (ports or "").strip(),
             })
     return items
-
 
 def list_containers():
     r = detect_runtime()
@@ -288,9 +262,7 @@ def list_containers():
         if VERBOSE: print("[snap] no container runtime found")
         return []
 
-    # --- PODMAN path ---
     if r == "podman":
-        # 1) Native array JSON (best)
         rc, out = _sh("podman ps --all --format json")
         if rc == 0 and out:
             try:
@@ -305,12 +277,10 @@ def list_containers():
                         "state": row.get("State") or "",
                         "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
                     })
-                if items:
-                    return items
+                if items: return items
             except Exception as e:
                 if VERBOSE: print("[snap] podman json array parse failed:", e)
 
-        # 2) Line-per-row JSON
         rc, out = _sh("podman ps -a --format '{{json .}}'")
         if rc == 0 and out:
             items = []
@@ -329,19 +299,14 @@ def list_containers():
                     "state": row.get("State") or "",
                     "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
                 })
-            if items:
-                return items
+            if items: return items
 
-        # 3) Pipe-delimited fallback
         rc, out = _sh("podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
         if rc == 0 and out:
             return _parse_ps_pipe_lines(out)
-
         if VERBOSE: print("[snap] podman ps produced no containers")
         return []
 
-    # --- DOCKER path ---
-    # 1) Line-per-row JSON (common)
     rc, out = _sh("docker ps -a --format '{{json .}}'")
     if rc == 0 and out:
         items = []
@@ -360,14 +325,11 @@ def list_containers():
                 "state": row.get("State") or "",
                 "ports": row.get("Ports"),
             })
-        if items:
-            return items
+        if items: return items
 
-    # 2) Pipe-delimited fallback
     rc, out = _sh("docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
     if rc == 0 and out:
         return _parse_ps_pipe_lines(out)
-
     if VERBOSE: print("[snap] docker ps produced no containers")
     return []
 
@@ -409,6 +371,7 @@ async def collect_snapshot():
         "ips": get_ips(),
         "runtime": detect_runtime(),
         "containers": list_containers(),
+        "control": {"enabled": bool(ALLOW_CONTROL)},   # <-- advertise capability
     }
 
 async def snapshot_loop(queue: asyncio.Queue, interval_sec: int):
@@ -424,19 +387,49 @@ async def snapshot_loop(queue: asyncio.Queue, interval_sec: int):
         await queue.put(json.dumps(snap, separators=(",", ":")))
         await asyncio.sleep(interval_sec)
 
+# ---------- Control receiver ----------
+async def _do_reboot():
+    if VERBOSE: print("[ctl] executing reboot")
+    try:
+        # pick something that's present on most distros
+        subprocess.Popen(["sh", "-lc", "systemctl reboot || reboot -f || /sbin/reboot -f >/dev/null 2>&1 &"])
+    except Exception as e:
+        print("[ctl] reboot spawn failed:", e, file=sys.stderr)
+
+async def control_receiver(ws):
+    if not ALLOW_CONTROL:
+        return
+    print("[agent] control receiver ENABLED (AGENT_ALLOW_CONTROL=1)")
+    try:
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") != "control":
+                continue
+
+            action = msg.get("action")
+            if VERBOSE: print("[ctl] received:", msg)
+
+            if action == "reboot":
+                await _do_reboot()
+            # (future) elif action == "container": ...
+    except Exception as e:
+        if VERBOSE:
+            print("[ctl] receiver ended:", e)
+
 # ---------- Sender ----------
 async def send_loop(queue: asyncio.Queue):
-    """
-    Maintain a WS connection; drain spool first, then send live queue.
-    On failure: append to spool, backoff, and reconnect.
-    """
+    import websockets
     backoff = RECONNECT_MIN
 
     while True:
         ssl_ctx = None
         if SERVER_URL.startswith("wss://"):
             ssl_ctx = ssl.create_default_context()
-            # For lab/testing with self-signed certs, allow override:
             if env("TLS_INSECURE", "0") == "1":
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -449,15 +442,23 @@ async def send_loop(queue: asyncio.Queue):
             ) as ws:
                 if VERBOSE: print("[ws] connected")
 
+                # tell the server our capabilities (incl. control)
+                hello = {"type":"hello","device_id":DEVICE_ID,"control":{"enabled":bool(ALLOW_CONTROL)}}
+                try:
+                    await ws.send(json.dumps(hello, separators=(",",":")))
+                except Exception:
+                    pass
+
+                # start control receiver (non-blocking)
+                ctrl_task = asyncio.create_task(control_receiver(ws))
+
                 # 1) drain any spooled messages first
                 for f, line in list(spool.drain_iter()):
                     try:
                         await ws.send(line)
                     except Exception as e:
                         if VERBOSE: print(f"[ws] drain failed ({e}); keeping {f.name}")
-                        # stop draining; keep file for later
                         raise
-                # remove old spool files (not 'current')
                 for f in list(spool.files()):
                     if f.name != "current.jsonl":
                         try: f.unlink()
@@ -477,7 +478,6 @@ async def send_loop(queue: asyncio.Queue):
             raise
         except Exception as e:
             if VERBOSE: print(f"[ws] disconnected: {e}")
-            # Backoff with jitter
             delay = backoff + random.random() * 0.5
             backoff = min(RECONNECT_MAX, backoff * 1.7)
             await asyncio.sleep(delay)
@@ -485,9 +485,10 @@ async def send_loop(queue: asyncio.Queue):
 # ---------- Main ----------
 async def main():
     print(f"[agent] device_id={DEVICE_ID} input={INPUT} url={SERVER_URL}")
+    if ALLOW_CONTROL:
+        print("[agent] control receiver ENABLED (AGENT_ALLOW_CONTROL=1)")
     q = asyncio.Queue(maxsize=10_000)
 
-    # Start source
     if INPUT == "journal":
         src = asyncio.create_task(read_journal(q))
     elif INPUT == "files":
@@ -498,13 +499,9 @@ async def main():
         print(f"[agent] unknown INPUT={INPUT}", file=sys.stderr)
         return 2
 
-    # Start snapshot loop (for Summary left panel)
     snap_task = asyncio.create_task(snapshot_loop(q, SNAPSHOT_SEC))
-
-    # Sender
     sender = asyncio.create_task(send_loop(q))
 
-    # Graceful shutdown: flush in-memory queue to spool
     stopping = asyncio.Event()
     def _stop(*_):
         if not stopping.is_set():
@@ -518,18 +515,13 @@ async def main():
 
     await stopping.wait()
     try:
-        src.cancel()
-        sender.cancel()
-        snap_task.cancel()
+        src.cancel(); sender.cancel(); snap_task.cancel()
     except:
         pass
 
-    # Drain queue to spool
     while not q.empty():
-        try:
-            spool.put(q.get_nowait())
-        except:
-            break
+        try: spool.put(q.get_nowait())
+        except: break
     print("[agent] bye")
 
 if __name__ == "__main__":
