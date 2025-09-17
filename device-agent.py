@@ -5,7 +5,8 @@ Python device log agent
 - Transport: WebSocket (ws:// or wss://), 1 JSON record per message
 - Offline-friendly: spools to disk and drains on reconnect
 - Snapshots: periodic "type: snapshot" frames with OS/IP/containers for UI Summary
-- Optional control: receive {type:'control',action:'reboot'} from server when AGENT_ALLOW_CONTROL=1
+- Sends a one-time "type: hello" frame (name + allow_control) on connect
+- Config: env vars (see constants below)
 Requires: pip3 install websockets
 """
 
@@ -23,21 +24,64 @@ def env(key, default=None, cast=str):
     except:
         return v
 
+def _read_file_first(path):
+    try:
+        # Many devicetree files have trailing NULs; strip them.
+        return pathlib.Path(path).read_text(encoding="utf-8", errors="ignore").strip().strip("\x00")
+    except Exception:
+        return ""
+
+def get_soc_serial():
+    """
+    Try several common places for a stable SoC/device serial.
+    """
+    for p in (
+        "/sys/bus/soc/devices/soc0/serial_number",
+        "/proc/device-tree/serial-number",
+        "/sys/firmware/devicetree/base/serial-number",
+    ):
+        s = _read_file_first(p)
+        if s:
+            return s
+    # Raspberry Pi style fallback
+    try:
+        txt = pathlib.Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="ignore")
+        for ln in txt.splitlines():
+            if ln.lower().startswith("serial"):
+                return ln.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+def _machine_id_or_hostname():
+    p = pathlib.Path("/etc/machine-id")
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    try:
+        return os.uname().nodename
+    except Exception:
+        return "unknown-device"
+
+SOC_SERIAL = get_soc_serial()
+DEFAULT_ID = SOC_SERIAL or _machine_id_or_hostname()
+
 SERVER     = env("SERVER_URL", "ws://127.0.0.1:4000/ingest")
-DEVICE_ID  = env("DEVICE_ID", (pathlib.Path("/etc/machine-id").read_text().strip()
-                               if pathlib.Path("/etc/machine-id").exists()
-                               else os.uname().nodename))
-INPUT      = env("INPUT", "journal")               # 'journal' | 'files' | 'demo'
-FILES      = env("FILES", "")                      # comma-separated, glob patterns allowed
+DEVICE_ID  = env("DEVICE_ID", DEFAULT_ID)
+DEVICE_NAME = env("DEVICE_NAME", DEFAULT_ID)   # default name = ID (SoC serial)
+INPUT      = env("INPUT", "journal")           # 'journal' | 'files' | 'demo'
+FILES      = env("FILES", "")                  # comma-separated, glob patterns allowed
 SPOOL_DIR  = pathlib.Path(env("SPOOL_DIR", "/var/lib/device-agent/spool"))
-SPOOL_MAX_FILE = int(env("SPOOL_MAX_FILE", 1024*1024))  # bytes per spool file (~1MB)
+SPOOL_MAX_FILE = int(env("SPOOL_MAX_FILE", 1024*1024))  # ~1MB
 PING_SEC   = int(env("PING_SEC", 30))
 RECONNECT_MIN = float(env("RECONNECT_MIN", 1.5))
 RECONNECT_MAX = float(env("RECONNECT_MAX", 20.0))
 VERBOSE    = env("VERBOSE", "0") == "1"
 
-# Control channel
-ALLOW_CONTROL = (env("AGENT_ALLOW_CONTROL", "0") == "1")
+# Remote control (Server must also allow; this only advertises willingness)
+AGENT_ALLOW_CONTROL = env("AGENT_ALLOW_CONTROL", "0") == "1"
 
 # Snapshot heartbeat for Summary panel
 SNAPSHOT_SEC = int(env("SNAPSHOT_SEC", 10))  # <=0 disables snapshots
@@ -81,12 +125,10 @@ class Spool:
 
     def files(self):
         files = [p for p in self.dir.glob("*.jsonl")]
-        # ensure 'current' is last so older files drain first
         files.sort(key=lambda p: (p.name.startswith("current"), p.stat().st_mtime))
         return files
 
     def drain_iter(self):
-        """Yield (path, iterator over lines). Caller deletes file after success."""
         for f in self.files():
             try:
                 with f.open("r", encoding="utf-8") as fh:
@@ -108,16 +150,13 @@ async def read_journal(queue: asyncio.Queue):
 
     base = ["journalctl", "-o", "json", "--no-pager"]
     cmd = base + ["-f", "-n", str(n)]
-    if unit:
-        cmd += ["-u", unit]
-    if since:
-        cmd += ["--since", since]
+    if unit: cmd += ["-u", unit]
+    if since: cmd += ["--since", since]
 
     prefix = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
     full_cmd = prefix + cmd
 
-    if VERBOSE:
-        print("[src] exec:", " ".join(full_cmd))
+    if VERBOSE: print("[src] exec:", " ".join(full_cmd))
 
     proc = await asyncio.create_subprocess_exec(
         *full_cmd,
@@ -139,8 +178,7 @@ async def read_journal(queue: asyncio.Queue):
         if not bline:
             await asyncio.sleep(0.05)
             if proc.returncode is not None:
-                if VERBOSE:
-                    print(f"[src] journalctl exited rc={proc.returncode}")
+                if VERBOSE: print(f"[src] journalctl exited rc={proc.returncode}")
                 break
             continue
 
@@ -157,7 +195,8 @@ async def read_journal(queue: asyncio.Queue):
 
         if VERBOSE:
             preview = obj.get("MESSAGE") if isinstance(obj, dict) else str(obj)
-            preview = str(preview) if preview is not None else ""
+            if preview is not None:
+                preview = str(preview)
             print("[src] journal -> queue:", (preview[:120] + "…") if preview and len(preview) > 120 else preview)
 
         await queue.put(json.dumps(obj, separators=(",", ":")))
@@ -169,8 +208,7 @@ async def read_files(queue: asyncio.Queue, files_csv: str):
         return
 
     cmd = f"exec tail -n0 -f {files_csv}"
-    if VERBOSE:
-        print("[src] exec:", cmd)
+    if VERBOSE: print("[src] exec:", cmd)
 
     proc = await asyncio.create_subprocess_shell(
         cmd,
@@ -189,8 +227,7 @@ async def read_files(queue: asyncio.Queue, files_csv: str):
         if not bline:
             await asyncio.sleep(0.05)
             if proc.returncode is not None:
-                if VERBOSE:
-                    print(f"[src] tail exited rc={proc.returncode}")
+                if VERBOSE: print(f"[src] tail exited rc={proc.returncode}")
                 break
             continue
 
@@ -216,9 +253,9 @@ async def read_demo(queue: asyncio.Queue):
             "TS": datetime.now(timezone.utc).isoformat()
         }
         await queue.put(json.dumps(obj, separators=(",", ":")))
-        await asyncio.sleep(0.2)  # 5 msgs/sec
+        await asyncio.sleep(0.2)
 
-# ---------- Snapshot & system info ----------
+# ---------- Snapshot helpers ----------
 def _sh(cmd: str):
     try:
         out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL)
@@ -231,10 +268,8 @@ def detect_runtime():
         return RUNTIME_OVERRIDE
     try:
         import shutil
-        if shutil.which("podman"):
-            return "podman"
-        if shutil.which("docker"):
-            return "docker"
+        if shutil.which("podman"): return "podman"
+        if shutil.which("docker"): return "docker"
     except Exception:
         pass
     return None
@@ -277,9 +312,10 @@ def list_containers():
                         "state": row.get("State") or "",
                         "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
                     })
-                if items: return items
+                if items:
+                    return items
             except Exception as e:
-                if VERBOSE: print("[snap] podman json array parse failed:", e)
+                if VERBOSE: print("[snap] podman json parse failed:", e)
 
         rc, out = _sh("podman ps -a --format '{{json .}}'")
         if rc == 0 and out:
@@ -299,14 +335,15 @@ def list_containers():
                     "state": row.get("State") or "",
                     "ports": row.get("Ports") if isinstance(row.get("Ports"), str) else "",
                 })
-            if items: return items
+            if items:
+                return items
 
         rc, out = _sh("podman ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
         if rc == 0 and out:
             return _parse_ps_pipe_lines(out)
-        if VERBOSE: print("[snap] podman ps produced no containers")
         return []
 
+    # docker
     rc, out = _sh("docker ps -a --format '{{json .}}'")
     if rc == 0 and out:
         items = []
@@ -325,12 +362,12 @@ def list_containers():
                 "state": row.get("State") or "",
                 "ports": row.get("Ports"),
             })
-        if items: return items
+        if items:
+            return items
 
     rc, out = _sh("docker ps -a --format '{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}|{{.Ports}}'")
     if rc == 0 and out:
         return _parse_ps_pipe_lines(out)
-    if VERBOSE: print("[snap] docker ps produced no containers")
     return []
 
 def get_os_info():
@@ -366,66 +403,17 @@ async def collect_snapshot():
     return {
         "type": "snapshot",
         "device_id": DEVICE_ID,
+        "name": DEVICE_NAME,                 # include friendly name
         "ts": datetime.now(timezone.utc).isoformat(),
         "os": get_os_info(),
         "ips": get_ips(),
         "runtime": detect_runtime(),
         "containers": list_containers(),
-        "control": {"enabled": bool(ALLOW_CONTROL)},   # <-- advertise capability
     }
-
-async def snapshot_loop(queue: asyncio.Queue, interval_sec: int):
-    if interval_sec <= 0:
-        if VERBOSE:
-            print("[snap] disabled (SNAPSHOT_SEC<=0)")
-        return
-    while True:
-        snap = await collect_snapshot()
-        if VERBOSE:
-            cnt = len(snap.get("containers", []))
-            print(f"[snap] send: {snap['os'].get('name','')} {snap['os'].get('version','')} | {len(snap.get('ips',[]))} ip(s) | {cnt} container(s)")
-        await queue.put(json.dumps(snap, separators=(",", ":")))
-        await asyncio.sleep(interval_sec)
-
-# ---------- Control receiver ----------
-async def _do_reboot():
-    if VERBOSE: print("[ctl] executing reboot")
-    try:
-        # pick something that's present on most distros
-        subprocess.Popen(["sh", "-lc", "systemctl reboot || reboot -f || /sbin/reboot -f >/dev/null 2>&1 &"])
-    except Exception as e:
-        print("[ctl] reboot spawn failed:", e, file=sys.stderr)
-
-async def control_receiver(ws):
-    if not ALLOW_CONTROL:
-        return
-    print("[agent] control receiver ENABLED (AGENT_ALLOW_CONTROL=1)")
-    try:
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if not isinstance(msg, dict):
-                continue
-            if msg.get("type") != "control":
-                continue
-
-            action = msg.get("action")
-            if VERBOSE: print("[ctl] received:", msg)
-
-            if action == "reboot":
-                await _do_reboot()
-            # (future) elif action == "container": ...
-    except Exception as e:
-        if VERBOSE:
-            print("[ctl] receiver ended:", e)
 
 # ---------- Sender ----------
 async def send_loop(queue: asyncio.Queue):
-    import websockets
     backoff = RECONNECT_MIN
-
     while True:
         ssl_ctx = None
         if SERVER_URL.startswith("wss://"):
@@ -442,17 +430,19 @@ async def send_loop(queue: asyncio.Queue):
             ) as ws:
                 if VERBOSE: print("[ws] connected")
 
-                # tell the server our capabilities (incl. control)
-                hello = {"type":"hello","device_id":DEVICE_ID,"control":{"enabled":bool(ALLOW_CONTROL)}}
+                # send HELLO once per (re)connect so server knows our name
+                hello = {
+                    "type": "hello",
+                    "device_id": DEVICE_ID,
+                    "name": DEVICE_NAME,
+                    "allow_control": AGENT_ALLOW_CONTROL,
+                }
                 try:
-                    await ws.send(json.dumps(hello, separators=(",",":")))
-                except Exception:
-                    pass
+                    await ws.send(json.dumps(hello, separators=(",", ":")))
+                except Exception as e:
+                    if VERBOSE: print(f"[ws] hello send failed: {e}")
 
-                # start control receiver (non-blocking)
-                ctrl_task = asyncio.create_task(control_receiver(ws))
-
-                # 1) drain any spooled messages first
+                # drain old spooled logs first
                 for f, line in list(spool.drain_iter()):
                     try:
                         await ws.send(line)
@@ -464,8 +454,8 @@ async def send_loop(queue: asyncio.Queue):
                         try: f.unlink()
                         except: pass
 
-                # 2) stream live queue
                 backoff = RECONNECT_MIN
+                # stream live queue
                 while True:
                     line = await queue.get()
                     try:
@@ -483,9 +473,21 @@ async def send_loop(queue: asyncio.Queue):
             await asyncio.sleep(delay)
 
 # ---------- Main ----------
+async def snapshot_loop(queue: asyncio.Queue, interval_sec: int):
+    if interval_sec <= 0:
+        if VERBOSE: print("[snap] disabled (SNAPSHOT_SEC<=0)")
+        return
+    while True:
+        snap = await collect_snapshot()
+        if VERBOSE:
+            cnt = len(snap.get("containers", []))
+            print(f"[snap] send: {snap['os'].get('name','')} {snap['os'].get('version','')} | {len(snap.get('ips',[]))} ip(s) | {cnt} container(s)")
+        await queue.put(json.dumps(snap, separators=(",", ":")))
+        await asyncio.sleep(interval_sec)
+
 async def main():
     print(f"[agent] device_id={DEVICE_ID} input={INPUT} url={SERVER_URL}")
-    if ALLOW_CONTROL:
+    if AGENT_ALLOW_CONTROL:
         print("[agent] control receiver ENABLED (AGENT_ALLOW_CONTROL=1)")
     q = asyncio.Queue(maxsize=10_000)
 
