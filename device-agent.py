@@ -380,7 +380,7 @@ def get_os_info():
                     k, v = ln.split("=", 1)
                     data[k.strip()] = v.strip().strip('"')
             name = data.get("NAME", "")
-            version = data.get("VERSION", "") or data.get("VERSION_ID", "")
+            version = data.get("VERSION_ID", "")
             build = data.get("BUILD_ID", "") or data.get("IMAGE_ID", "") or data.get("PRETTY_NAME", "")
     except Exception:
         pass
@@ -399,6 +399,15 @@ def get_ips():
                 pass
     return ips
 
+def get_ostree_rev(short=True, length=8):
+    rc, out = _sh("ostree admin status | head -n 1 | awk '{print $3}'")
+    if rc == 0 and out:
+        rev = out.strip().split('.')[0]  # remove `.0` suffix
+        if short:
+            return rev[:length]
+        return rev
+    return None
+
 async def collect_snapshot():
     return {
         "type": "snapshot",
@@ -407,6 +416,7 @@ async def collect_snapshot():
         "ts": datetime.now(timezone.utc).isoformat(),
         "os": get_os_info(),
         "ips": get_ips(),
+        "ostree_rev": get_ostree_rev(),
         "runtime": detect_runtime(),
         "containers": list_containers(),
     }
