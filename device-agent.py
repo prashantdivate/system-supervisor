@@ -10,9 +10,11 @@ Python device log agent
 Requires: pip3 install websockets
 """
 
-import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess
+import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess, shutil
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
+from collections import defaultdict
+from pathlib import Path
 
 # ---------- Config helpers ----------
 def env(key, default=None, cast=str):
@@ -419,6 +421,170 @@ async def collect_snapshot():
         "ostree_rev": get_ostree_rev(),
         "runtime": detect_runtime(),
         "containers": list_containers(),
+		"diag": get_diag(),
+    }
+
+def _read_first(path):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return None
+
+def get_uptime_sec():
+    try:
+        s = _read_first("/proc/uptime")
+        return float(s.split()[0])
+    except Exception:
+        return None
+
+def get_loadavg():
+    try:
+        import os
+        l1, l5, l15 = os.getloadavg()
+        return [float(l1), float(l5), float(l15)]
+    except Exception:
+        try:
+            s = _read_first("/proc/loadavg") or ""
+            p = s.split()
+            return [float(p[0]), float(p[1]), float(p[2])]
+        except Exception:
+            return [None, None, None]
+
+def get_mem():
+    """Return total/used (kB) from /proc/meminfo."""
+    try:
+        info = {}
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            if ":" in ln:
+                k, v = ln.split(":", 1)
+                info[k.strip()] = int(v.strip().split()[0])  # kB
+        total = info.get("MemTotal")
+        avail = info.get("MemAvailable")
+        used = (total - avail) if (total and avail) else None
+        return {"total_kb": total, "used_kb": used}
+    except Exception:
+        return {"total_kb": None, "used_kb": None}
+
+def get_disk_root():
+    """Return total/used (kB) for root filesystem via df -P /."""
+    rc, out = _sh("df -P / | awk 'NR==2{print $2\" \" $3}'")
+    try:
+        if rc == 0 and out:
+            t, u = out.split()
+            return {"total_kb": int(t), "used_kb": int(u)}
+    except Exception:
+        pass
+    return {"total_kb": None, "used_kb": None}
+
+def get_cpu_temp_c():
+    """Try common thermal files; fallback to vcgencmd if present."""
+    candidates = [
+        "/sys/class/thermal/thermal_zone0/temp",
+        "/sys/class/hwmon/hwmon0/temp1_input",
+        "/sys/devices/virtual/thermal/thermal_zone0/temp",
+    ]
+    for p in candidates:
+        raw = _read_first(p)
+        if raw and raw.strip().isdigit():
+            try:
+                v = int(raw.strip())
+                return v / 1000.0 if v > 200 else float(v)  # some platforms already in °C
+            except Exception:
+                pass
+    rc, out = _sh("command -v vcgencmd >/dev/null 2>&1 && vcgencmd measure_temp || true")
+    if rc == 0 and out and "temp=" in out:
+        try:
+            return float(out.split("temp=")[1].split("'")[0])
+        except Exception:
+            pass
+    return None
+
+def list_systemd_services():
+    """
+    Return a list of services with fields: unit, load, active, sub, description.
+    Uses JSON output when available, falls back to column parsing.
+    """
+    # Try JSON output first (newer systemd)
+    rc, out = _sh("systemctl list-units --type=service --all --no-legend --no-pager --plain --output=json 2>/dev/null")
+    if rc == 0 and out and out.strip().startswith("["):
+        try:
+            arr = json.loads(out)
+            items = []
+            for row in arr:
+                items.append({
+                    "unit": row.get("unit") or row.get("name") or "",
+                    "load": (row.get("load") or "").lower(),
+                    "active": (row.get("active") or "").lower(),
+                    "sub": (row.get("sub") or "").lower(),
+                    "description": row.get("description") or "",
+                })
+            return items
+        except Exception:
+            pass
+
+    # Fallback: parse columns
+    rc, out = _sh("systemctl list-units --type=service --all --no-legend --no-pager --plain 2>/dev/null")
+    items = []
+    if rc == 0 and out:
+        for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            # Expected columns: UNIT LOAD ACTIVE SUB DESCRIPTION...
+            parts = ln.split()
+            if len(parts) >= 5:
+                unit, load, active, sub = parts[:4]
+                desc = " ".join(parts[4:])
+                items.append({
+                    "unit": unit,
+                    "load": load.lower(),
+                    "active": active.lower(),
+                    "sub": sub.lower(),
+                    "description": desc,
+                })
+    return items
+
+def get_systemd_summary(max_failed=8):
+    # If systemctl is missing, return None
+    rc, _ = _sh("command -v systemctl >/dev/null 2>&1; echo $?")
+    try:
+        if int(_.strip()) != 0:
+            return None
+    except Exception:
+        pass
+
+    items = list_systemd_services()
+    if not items:
+        return {"total": 0, "counts": {}, "failed": []}
+
+    counts = defaultdict(int)
+    for s in items:
+        st = (s.get("active") or "").lower()
+        counts[st] += 1
+
+    failed = [s for s in items if (s.get("active") or "").lower() == "failed"]
+    # sort failed by unit name for stable display
+    failed.sort(key=lambda x: x.get("unit",""))
+    return {
+        "total": len(items),
+        "counts": {
+            "active": counts.get("active", 0),
+            "inactive": counts.get("inactive", 0),
+            "failed": counts.get("failed", 0),
+            "activating": counts.get("activating", 0),
+            "deactivating": counts.get("deactivating", 0),
+        },
+        "failed": failed[:max_failed],
+    }
+
+def get_diag():
+    return {
+        "uptime_sec": get_uptime_sec(),
+        "loadavg": get_loadavg(),            # [1, 5, 15]
+        "mem": get_mem(),                    # {total_kb, used_kb}
+        "disk": get_disk_root(),             # {total_kb, used_kb}
+        "cpu_temp_c": get_cpu_temp_c(),      # float or None
+		"systemd": get_systemd_summary(),
     }
 
 # ---------- Sender ----------
