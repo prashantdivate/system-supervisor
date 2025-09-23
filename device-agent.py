@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from collections import defaultdict
 from pathlib import Path
+import re
 
 # ---------- Config helpers ----------
 def env(key, default=None, cast=str):
@@ -410,6 +411,27 @@ def get_ostree_rev(short=True, length=8):
         return rev
     return None
 
+_public_ip_cache = {"ip": None, "ts": 0}
+
+def get_public_ip_cached(ttl_sec: int = 3600):
+    now = time.time()
+    if _public_ip_cache["ip"] and (now - _public_ip_cache["ts"] < ttl_sec):
+        return _public_ip_cache["ip"]
+
+    for cmd in [
+        "curl -s https://api.ipify.org",
+        "curl -s https://ifconfig.me",
+        "dig +short myip.opendns.com @resolver1.opendns.com",
+    ]:
+        rc, out = _sh(cmd)
+        if rc == 0:
+            ip = (out or "").strip()
+            if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
+                _public_ip_cache["ip"] = ip
+                _public_ip_cache["ts"] = now
+                return ip
+    return _public_ip_cache["ip"]
+
 async def collect_snapshot():
     return {
         "type": "snapshot",
@@ -421,7 +443,8 @@ async def collect_snapshot():
         "ostree_rev": get_ostree_rev(),
         "runtime": detect_runtime(),
         "containers": list_containers(),
-		"diag": get_diag(),
+        "diag": get_diag(),
+        "public_ip": get_public_ip_cached(),
     }
 
 def _read_first(path):
@@ -584,7 +607,7 @@ def get_diag():
         "mem": get_mem(),                    # {total_kb, used_kb}
         "disk": get_disk_root(),             # {total_kb, used_kb}
         "cpu_temp_c": get_cpu_temp_c(),      # float or None
-		"systemd": get_systemd_summary(),
+                "systemd": get_systemd_summary(),
     }
 
 # ---------- Sender ----------
@@ -707,4 +730,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
-
