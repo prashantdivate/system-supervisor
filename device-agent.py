@@ -6,16 +6,15 @@ Python device log agent
 - Offline-friendly: spools to disk and drains on reconnect
 - Snapshots: periodic "type: snapshot" frames with OS/IP/containers for UI Summary
 - Sends a one-time "type: hello" frame (name + allow_control) on connect
-- Config: env vars (see constants below)
+- Config via env vars (see constants below)
 Requires: pip3 install websockets
 """
 
-import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess, shutil
+import asyncio, json, os, sys, time, ssl, signal, pathlib, random, subprocess, shutil, shlex, re
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from collections import defaultdict
 from pathlib import Path
-import re
 
 # ---------- Config helpers ----------
 def env(key, default=None, cast=str):
@@ -24,7 +23,7 @@ def env(key, default=None, cast=str):
         return default
     try:
         return cast(v)
-    except:
+    except Exception:
         return v
 
 def _read_file_first(path):
@@ -33,6 +32,12 @@ def _read_file_first(path):
         return pathlib.Path(path).read_text(encoding="utf-8", errors="ignore").strip().strip("\x00")
     except Exception:
         return ""
+
+def _read_first(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return None
 
 def get_soc_serial():
     """
@@ -73,9 +78,9 @@ DEFAULT_ID = SOC_SERIAL or _machine_id_or_hostname()
 
 SERVER     = env("SERVER_URL", "ws://127.0.0.1:4000/ingest")
 DEVICE_ID  = env("DEVICE_ID", DEFAULT_ID)
-DEVICE_NAME = env("DEVICE_NAME", DEFAULT_ID)   # default name = ID (SoC serial)
+DEVICE_NAME = env("DEVICE_NAME", DEFAULT_ID)   # default = ID
 INPUT      = env("INPUT", "journal")           # 'journal' | 'files' | 'demo'
-FILES      = env("FILES", "")                  # comma-separated, glob patterns allowed
+FILES      = env("FILES", "")                  # comma-separated, glob allowed
 SPOOL_DIR  = pathlib.Path(env("SPOOL_DIR", "/var/lib/device-agent/spool"))
 SPOOL_MAX_FILE = int(env("SPOOL_MAX_FILE", 1024*1024))  # ~1MB
 PING_SEC   = int(env("PING_SEC", 30))
@@ -146,7 +151,7 @@ spool = Spool(SPOOL_DIR, SPOOL_MAX_FILE)
 
 # ---------- Log sources ----------
 async def read_journal(queue: asyncio.Queue):
-    import shutil
+    import shutil as _shutil
     n = os.environ.get("JOURNAL_N", "0")
     unit = os.environ.get("JOURNAL_UNIT")
     since = os.environ.get("JOURNAL_SINCE")
@@ -156,7 +161,7 @@ async def read_journal(queue: asyncio.Queue):
     if unit: cmd += ["-u", unit]
     if since: cmd += ["--since", since]
 
-    prefix = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
+    prefix = ["stdbuf", "-oL", "-eL"] if _shutil.which("stdbuf") else []
     full_cmd = prefix + cmd
 
     if VERBOSE: print("[src] exec:", " ".join(full_cmd))
@@ -270,7 +275,6 @@ def detect_runtime():
     if RUNTIME_OVERRIDE:
         return RUNTIME_OVERRIDE
     try:
-        import shutil
         if shutil.which("podman"): return "podman"
         if shutil.which("docker"): return "docker"
     except Exception:
@@ -412,7 +416,6 @@ def get_ostree_rev(short=True, length=8):
     return None
 
 _public_ip_cache = {"ip": None, "ts": 0}
-
 def get_public_ip_cached(ttl_sec: int = 3600):
     now = time.time()
     if _public_ip_cache["ip"] and (now - _public_ip_cache["ts"] < ttl_sec):
@@ -426,32 +429,23 @@ def get_public_ip_cached(ttl_sec: int = 3600):
         rc, out = _sh(cmd)
         if rc == 0:
             ip = (out or "").strip()
+            # Correct IPv4 regex (no double-escaping)
             if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
                 _public_ip_cache["ip"] = ip
                 _public_ip_cache["ts"] = now
                 return ip
     return _public_ip_cache["ip"]
 
-async def collect_snapshot():
-    return {
-        "type": "snapshot",
-        "device_id": DEVICE_ID,
-        "name": DEVICE_NAME,                 # include friendly name
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "os": get_os_info(),
-        "ips": get_ips(),
-        "ostree_rev": get_ostree_rev(),
-        "runtime": detect_runtime(),
-        "containers": list_containers(),
-        "diag": get_diag(),
-        "public_ip": get_public_ip_cached(),
-    }
-
-def _read_first(path):
+# ---------- Disk / Memory / Diag ----------
+def get_disk_usage(path):
+    rc, out = _sh(f"df -P {shlex.quote(path)} | awk 'NR==2{{print $2\" \" $3}}'")
     try:
-        return Path(path).read_text().strip()
+        if rc == 0 and out:
+            t, u = out.split()
+            return {"path": path, "total_kb": int(t), "used_kb": int(u)}
     except Exception:
-        return None
+        pass
+    return {"path": path, "total_kb": None, "used_kb": None}
 
 def get_uptime_sec():
     try:
@@ -462,8 +456,7 @@ def get_uptime_sec():
 
 def get_loadavg():
     try:
-        import os
-        l1, l5, l15 = os.getloadavg()
+        l1, l5, l15 = os.getloadavg()  # type: ignore
         return [float(l1), float(l5), float(l15)]
     except Exception:
         try:
@@ -474,7 +467,7 @@ def get_loadavg():
             return [None, None, None]
 
 def get_mem():
-    """Return total/used (kB) from /proc/meminfo."""
+    """Return total/used/available (kB) from /proc/meminfo, plus free & used_pct."""
     try:
         info = {}
         for ln in Path("/proc/meminfo").read_text().splitlines():
@@ -483,21 +476,24 @@ def get_mem():
                 info[k.strip()] = int(v.strip().split()[0])  # kB
         total = info.get("MemTotal")
         avail = info.get("MemAvailable")
-        used = (total - avail) if (total and avail) else None
-        return {"total_kb": total, "used_kb": used}
+        free  = info.get("MemFree")
+        used  = (total - avail) if (total and avail is not None) else None
+        pct   = round((used / total) * 100, 1) if (total and used is not None) else None
+        return {
+            "total_kb": total,
+            "used_kb": used,
+            "available_kb": avail,
+            "free_kb": free,
+            "used_pct": pct,
+        }
     except Exception:
-        return {"total_kb": None, "used_kb": None}
-
-def get_disk_root():
-    """Return total/used (kB) for root filesystem via df -P /."""
-    rc, out = _sh("df -P / | awk 'NR==2{print $2\" \" $3}'")
-    try:
-        if rc == 0 and out:
-            t, u = out.split()
-            return {"total_kb": int(t), "used_kb": int(u)}
-    except Exception:
-        pass
-    return {"total_kb": None, "used_kb": None}
+        return {
+            "total_kb": None,
+            "used_kb": None,
+            "available_kb": None,
+            "free_kb": None,
+            "used_pct": None,
+        }
 
 def get_cpu_temp_c():
     """Try common thermal files; fallback to vcgencmd if present."""
@@ -507,7 +503,7 @@ def get_cpu_temp_c():
         "/sys/devices/virtual/thermal/thermal_zone0/temp",
     ]
     for p in candidates:
-        raw = _read_first(p)
+        raw = _read_file_first(p)
         if raw and raw.strip().isdigit():
             try:
                 v = int(raw.strip())
@@ -527,6 +523,14 @@ def list_systemd_services():
     Return a list of services with fields: unit, load, active, sub, description.
     Uses JSON output when available, falls back to column parsing.
     """
+    # If systemctl is missing, return None
+    rc, _out = _sh("command -v systemctl >/dev/null 2>&1; echo $?")
+    try:
+        if int(_out.strip()) != 0:
+            return None
+    except Exception:
+        pass
+
     # Try JSON output first (newer systemd)
     rc, out = _sh("systemctl list-units --type=service --all --no-legend --no-pager --plain --output=json 2>/dev/null")
     if rc == 0 and out and out.strip().startswith("["):
@@ -545,7 +549,7 @@ def list_systemd_services():
         except Exception:
             pass
 
-    # Fallback: parse columns
+    # Fallback: parse columns (fix typo: /dev/null)
     rc, out = _sh("systemctl list-units --type=service --all --no-legend --no-pager --plain 2>/dev/null")
     items = []
     if rc == 0 and out:
@@ -568,25 +572,14 @@ def list_systemd_services():
     return items
 
 def get_systemd_summary(max_failed=8):
-    # If systemctl is missing, return None
-    rc, _ = _sh("command -v systemctl >/dev/null 2>&1; echo $?")
-    try:
-        if int(_.strip()) != 0:
-            return None
-    except Exception:
-        pass
-
     items = list_systemd_services()
-    if not items:
-        return {"total": 0, "counts": {}, "failed": []}
-
+    if items is None:
+        return None
     counts = defaultdict(int)
     for s in items:
         st = (s.get("active") or "").lower()
         counts[st] += 1
-
     failed = [s for s in items if (s.get("active") or "").lower() == "failed"]
-    # sort failed by unit name for stable display
     failed.sort(key=lambda x: x.get("unit",""))
     return {
         "total": len(items),
@@ -604,10 +597,29 @@ def get_diag():
     return {
         "uptime_sec": get_uptime_sec(),
         "loadavg": get_loadavg(),            # [1, 5, 15]
-        "mem": get_mem(),                    # {total_kb, used_kb}
-        "disk": get_disk_root(),             # {total_kb, used_kb}
-        "cpu_temp_c": get_cpu_temp_c(),      # float or None
-                "systemd": get_systemd_summary(),
+        "mem": get_mem(),                    # {total_kb, used_kb, available_kb, free_kb, used_pct}
+        "disk": {
+            "root":    get_disk_usage("/"),
+            "sysroot": get_disk_usage("/sysroot"),
+            #"apps":    get_disk_usage("/apps"),
+        },
+        "cpu_temp_c": get_cpu_temp_c(),
+        "systemd": get_systemd_summary(),
+    }
+
+async def collect_snapshot():
+    return {
+        "type": "snapshot",
+        "device_id": DEVICE_ID,
+        "name": DEVICE_NAME,                 # include friendly name
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "os": get_os_info(),
+        "ips": get_ips(),
+        "ostree_rev": get_ostree_rev(),
+        "runtime": detect_runtime(),
+        "containers": list_containers(),
+        "diag": get_diag(),
+        "public_ip": get_public_ip_cached(),
     }
 
 # ---------- Sender ----------
@@ -651,7 +663,7 @@ async def send_loop(queue: asyncio.Queue):
                 for f in list(spool.files()):
                     if f.name != "current.jsonl":
                         try: f.unlink()
-                        except: pass
+                        except Exception: pass
 
                 backoff = RECONNECT_MIN
                 # stream live queue
@@ -717,12 +729,12 @@ async def main():
     await stopping.wait()
     try:
         src.cancel(); sender.cancel(); snap_task.cancel()
-    except:
+    except Exception:
         pass
 
     while not q.empty():
         try: spool.put(q.get_nowait())
-        except: break
+        except Exception: break
     print("[agent] bye")
 
 if __name__ == "__main__":
@@ -730,3 +742,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+
